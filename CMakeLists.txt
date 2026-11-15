@@ -22,8 +22,8 @@ juce_generate_juce_header(MajedAudioChordExtractor)
 
 target_sources(MajedAudioChordExtractor
     PRIVATE
-        PluginProcessor.cpp
-        PluginEditor.cpp
+        Source/PluginProcessor.cpp
+        Source/PluginEditor.cpp
 )
 
 target_compile_definitions(MajedAudioChordExtractor

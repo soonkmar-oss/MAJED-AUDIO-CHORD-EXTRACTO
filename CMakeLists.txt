@@ -18,6 +18,8 @@ juce_add_plugin(MajedAudioChordExtractor
     PRODUCT_NAME "MAJED AUDIO VST3"
 )
 
+juce_generate_juce_header(MajedAudioChordExtractor)
+
 target_sources(MajedAudioChordExtractor
     PRIVATE
         PluginProcessor.cpp
@@ -34,6 +36,7 @@ target_compile_definitions(MajedAudioChordExtractor
 target_link_libraries(MajedAudioChordExtractor
     PRIVATE
         juce::juce_audio_utils
+        juce::juce_dsp
     PUBLIC
         juce::juce_recommended_config_flags
         juce::juce_recommended_lto_flags

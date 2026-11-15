@@ -1,54 +1,52 @@
+#include "PluginProcessor.h"
 #include "PluginEditor.h"
 
-MajedAudioEditor::MajedAudioEditor (MajedAudioProcessor& p)
-    : AudioProcessorEditor (&p), processor (p)
+MajedAudioProcessorEditor::MajedAudioProcessorEditor (MajedAudioProcessor& p)
+    : AudioProcessorEditor (&p), processorRef (p)
 {
-    setSize (520, 330);
-    title.setText ("MAJED AUDIO", juce::dontSendNotification);
-    title.setFont (juce::Font (28.0f, juce::Font::bold));
-    title.setJustificationType (juce::Justification::centred);
-    addAndMakeVisible (title);
+    setSize (460, 300);
 
-    auto setup = [this] (juce::Label& l, const juce::String& t)
-    {
-        l.setText (t, juce::dontSendNotification);
-        l.setFont (juce::Font (18.0f));
-        l.setJustificationType (juce::Justification::centred);
-        addAndMakeVisible (l);
-    };
-    setup (note, "النغمة: --");
-    setup (chord, "الكورد المقترح: --");
-    setup (scale, "المقام / السلم: غير محدد");
-    setup (confidence, "ثقة الكشف: --");
+    addAndMakeVisible (exportMidiButton);
+    exportMidiButton.onClick = [this] { processorRef.requestMidiExport(); };
 
-    midiButton.onClick = [this] { processor.requestMidiExport(); };
-    addAndMakeVisible (midiButton);
-    startTimerHz (8);
+    startTimerHz (15);
 }
 
-void MajedAudioEditor::paint (juce::Graphics& g)
+void MajedAudioProcessorEditor::paint (juce::Graphics& g)
 {
-    g.fillAll (juce::Colour (0xff10151d));
-    g.setColour (juce::Colour (0xffc49b54));
-    g.drawRoundedRectangle (getLocalBounds().toFloat().reduced (10.0f), 14.0f, 2.0f);
+    g.fillAll (juce::Colour (0xff141824));
+
+    g.setColour (juce::Colours::white);
+    g.setFont (juce::Font (20.0f, juce::Font::bold));
+    g.drawText ("MAJED AUDIO - Chord & Maqam Extractor", 20, 15, getWidth() - 40, 30, juce::Justification::centred);
+
+    g.setColour (juce::Colour (0xff1f2638));
+    g.fillRoundedRectangle (20.0f, 60.0f, (float) getWidth() - 40.0f, 165.0f, 10.0f);
+
+    g.setColour (juce::Colours::lightgrey);
+    g.setFont (16.0f);
+    g.drawText ("Detected Note: " + processorRef.getDetectedNote(), 35, 75, 380, 28, juce::Justification::left);
+
+    g.setColour (juce::Colour (0xff4ee4a0));
+    g.setFont (juce::Font (22.0f, juce::Font::bold));
+    g.drawText ("Suggested Chord: " + processorRef.getSuggestedChord(), 35, 112, 380, 32, juce::Justification::left);
+
+    g.setColour (juce::Colours::skyblue);
+    g.setFont (17.0f);
+    g.drawText ("Maqam / Scale: " + processorRef.getDetectedScale(), 35, 152, 380, 28, juce::Justification::left);
+
+    int confPct = juce::roundToInt (processorRef.getConfidence() * 100.0f);
+    g.setColour (juce::Colours::grey);
+    g.setFont (14.0f);
+    g.drawText ("Confidence: " + juce::String (confPct) + "%", 35, 185, 380, 24, juce::Justification::left);
 }
 
-void MajedAudioEditor::resized()
+void MajedAudioProcessorEditor::resized()
 {
-    auto area = getLocalBounds().reduced (24);
-    title.setBounds (area.removeFromTop (55));
-    area.removeFromTop (12);
-    note.setBounds (area.removeFromTop (42));
-    chord.setBounds (area.removeFromTop (42));
-    scale.setBounds (area.removeFromTop (42));
-    confidence.setBounds (area.removeFromTop (36));
-    midiButton.setBounds (area.removeFromTop (42).reduced (70, 2));
+    exportMidiButton.setBounds (getWidth() / 2 - 90, 242, 180, 38);
 }
 
-void MajedAudioEditor::timerCallback()
+void MajedAudioProcessorEditor::timerCallback()
 {
-    note.setText ("النغمة المكتشفة: " + processor.getDetectedNote(), juce::dontSendNotification);
-    chord.setText ("الكورد المقترح: " + processor.getSuggestedChord(), juce::dontSendNotification);
-    scale.setText ("المقام / السلم: " + processor.getDetectedScale(), juce::dontSendNotification);
-    confidence.setText ("ثقة الكشف: " + juce::String (processor.getConfidence() * 100.0f, 1) + "%", juce::dontSendNotification);
+    repaint();
 }

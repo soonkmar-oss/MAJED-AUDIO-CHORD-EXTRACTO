@@ -10,20 +10,20 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-    - name: Configure CMake
-      run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Download JUCE Framework
+        run: git clone --depth 1 --branch 7.0.12 https://github.com JUCE
 
-    - name: Build VST3 Plugin
-      run: cmake --build build --config Release
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
 
-    - name: Upload VST3 Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: MAJED-AUDIO-ChordExtractor-VST3
-        path: build/**/*_artefacts/Release/VST3/*.vst3
-        
+      - name: Build VST3 Plugin
+        run: cmake --build build --config Release --parallel
+
+      - name: Upload VST3 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MAJED-AUDIO-VST3-Windows
+          path: build/**/*_artefacts/Release/VST3/*.vst3

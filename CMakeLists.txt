@@ -6,8 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 include(FetchContent)
 FetchContent_Declare(
     JUCE
-    GIT_REPOSITORY https://github.com
-    GIT_TAG 7.0.12
+    URL https://github.com
 )
 FetchContent_MakeAvailable(JUCE)
 
@@ -45,4 +44,3 @@ target_link_libraries(MajedAudioChordExtractor
         juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags
 )
-

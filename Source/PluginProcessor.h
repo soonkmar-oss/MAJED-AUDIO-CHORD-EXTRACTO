@@ -38,7 +38,7 @@ public:
 
 private:
     void analyseFrame();
-    float estimatePitchHz (const float* data, int n) const;
+    float estimatePitchHz (const float* data, int n);
     juce::String noteNameFromMidi (int midi) const;
 
     juce::AudioBuffer<float> analysisBuffer;
@@ -48,7 +48,8 @@ private:
     std::atomic<int> suggestedRoot { -1 };
     std::atomic<int> suggestedQuality { 0 }; // 0 major, 1 minor
     std::atomic<float> confidence { 0.0f };
-    std::atomic<bool> midiExportRequested { false };\n    float pitchClassWeights[12] {}; // smoothed melody-note evidence, audio thread only
+    std::atomic<bool> midiExportRequested { false };
+    float pitchClassWeights[12] {}; // smoothed melody-note evidence, audio thread only
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MajedAudioProcessor)
 };

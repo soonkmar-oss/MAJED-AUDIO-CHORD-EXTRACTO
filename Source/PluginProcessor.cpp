@@ -1,21 +1,27 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include <cmath>
+#include <algorithm>
 
 MajedAudioProcessor::MajedAudioProcessor()
     : AudioProcessor (BusesProperties()
                       .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
-                      .withOutput ("Output", juce::AudioChannelSet::stereo(), true))
+                      .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+      forwardFFT (fftOrder),
+      window (fftSize, juce::dsp::WindowingFunction<float>::hann)
 {
-    analysisBuffer.setSize (1, 4096);
-    analysisBuffer.clear();
 }
 
 void MajedAudioProcessor::prepareToPlay (double sampleRate, int)
 {
     currentSampleRate = sampleRate > 0.0 ? sampleRate : 44100.0;
-    analysisBuffer.setSize (1, 4096);
-    analysisBuffer.clear();
-    writePosition = 0;
+    fifoIndex = 0;
+    fifo.fill (0.0f);
+    fftData.fill (0.0f);
+    chroma24.fill (0.0f);
+    smoothedChroma24.fill (0.0f);
+    bassChroma12.fill (0.0f);
+    maqamHistogram.fill (0.0f);
 }
 
 bool MajedAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -24,168 +30,260 @@ bool MajedAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) co
         && layouts.getMainOutputChannelSet() != juce::AudioChannelSet::stereo())
         return false;
 
-    if (layouts.getMainOutputChannelSet() != layouts.getMainInputChannelSet())
-        return false;
-
-    return true;
+    return layouts.getMainOutputChannelSet() == layouts.getMainInputChannelSet();
 }
 
-void MajedAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
+void MajedAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
 {
     juce::ScopedNoDenormals noDenormals;
     const int numSamples = buffer.getNumSamples();
     const int numChannels = buffer.getNumChannels();
 
-    if (numChannels > 0 && numSamples > 0)
+    if (numChannels == 0 || numSamples == 0)
+        return;
+
+    for (int i = 0; i < numSamples; ++i)
     {
-        auto* dest = analysisBuffer.getWritePointer (0);
-        const int bufSize = analysisBuffer.getNumSamples();
+        float mono = 0.0f;
+        for (int ch = 0; ch < numChannels; ++ch)
+            mono += buffer.getReadPointer (ch)[i];
 
-        for (int i = 0; i < numSamples; ++i)
-        {
-            float mono = 0.0f;
-            for (int ch = 0; ch < numChannels; ++ch)
-                mono += buffer.getReadPointer (ch)[i];
-
-            mono /= static_cast<float> (numChannels);
-            dest[writePosition] = mono;
-            writePosition = (writePosition + 1) % bufSize;
-        }
-
-        analyseFrame();
-    }
-
-    if (midiExportRequested.exchange (false))
-    {
-        int root = suggestedRoot.load();
-        int quality = suggestedQuality.load();
-        if (root >= 0)
-        {
-            int baseNote = 60 + root;
-            int third = baseNote + (quality == 1 ? 3 : 4);
-            int fifth = baseNote + 7;
-
-            midiMessages.addEvent (juce::MidiMessage::noteOn (1, baseNote, (juce::uint8) 100), 0);
-            midiMessages.addEvent (juce::MidiMessage::noteOn (1, third,    (juce::uint8) 100), 0);
-            midiMessages.addEvent (juce::MidiMessage::noteOn (1, fifth,    (juce::uint8) 100), 0);
-        }
+        mono /= static_cast<float> (numChannels);
+        pushNextSampleIntoFifo (mono);
     }
 }
 
-void MajedAudioProcessor::analyseFrame()
+void MajedAudioProcessor::pushNextSampleIntoFifo (float sample)
 {
-    const float* data = analysisBuffer.getReadPointer (0);
-    const int n = analysisBuffer.getNumSamples();
+    fifo[fifoIndex++] = sample;
 
-    float hz = estimatePitchHz (data, n);
-    if (hz > 50.0f && hz < 2000.0f)
+    if (fifoIndex == fftSize)
     {
-        int midi = juce::roundToInt (69.0 + 12.0 * std::log2 (hz / 440.0));
-        detectedMidi.store (midi);
+        std::copy (fifo.begin(), fifo.end(), fftData.begin());
+        processFFTFrame();
 
-        int pc = ((midi % 12) + 12) % 12;
-        pitchClassWeights = pitchClassWeights * 0.85f + 0.15f;
-        suggestedRoot.store (pc);
-        suggestedQuality.store ((pc == 2 || pc == 4 || pc == 9) ? 1 : 0);
+        // 50% overlap for smooth real-time tracking
+        std::move (fifo.begin() + fftSize / 2, fifo.end(), fifo.begin());
+        fifoIndex = fftSize / 2;
     }
 }
 
-float MajedAudioProcessor::estimatePitchHz (const float* data, int n)
+void MajedAudioProcessor::processFFTFrame()
 {
-    float rms = 0.0f;
-    for (int i = 0; i < n; ++i)
-        rms += data[i] * data[i];
+    window.multiplyWithWindowingTable (fftData.data(), fftSize);
+    forwardFFT.performFrequencyOnlyForwardTransform (fftData.data());
 
-    rms = std::sqrt (rms / static_cast<float> (n));
-    if (rms < 0.01f)
+    chroma24.fill (0.0f);
+    bassChroma12.fill (0.0f);
+
+    float totalEnergy = 0.0f;
+    const int maxBin = fftSize / 2;
+    const double binWidth = currentSampleRate / static_cast<double> (fftSize);
+
+    for (int bin = 1; bin < maxBin; ++bin)
     {
-        confidence.store (0.0f);
-        return 0.0f;
-    }
+        double freq = bin * binWidth;
+        if (freq < 45.0 || freq > 4200.0)
+            continue;
 
-    int minLag = static_cast<int> (currentSampleRate / 1000.0);
-    int maxLag = static_cast<int> (currentSampleRate / 60.0);
-    if (maxLag >= n / 2) maxLag = n / 2 - 1;
+        float mag = fftData[bin];
+        if (mag < 0.001f)
+            continue;
 
-    float bestCorr = 0.0f;
-    int bestLag = 0;
+        float power = mag * mag;
+        totalEnergy += power;
 
-    for (int lag = minLag; lag <= maxLag; ++lag)
-    {
-        float corr = 0.0f;
-        float norm1 = 0.0f;
-        float norm2 = 0.0f;
+        // Map frequency to 24-TET quarter-tone pitch class (0 = C, 1 = C+50c, 2 = C#, ...)
+        double midiExact = 69.0 + 12.0 * std::log2 (freq / 440.0);
+        int qBin = juce::roundToInt (midiExact * 2.0) % 24;
+        if (qBin < 0) qBin += 24;
 
-        for (int i = 0; i < n - lag; ++i)
+        chroma24[qBin] += power;
+
+        // Dedicated Bass Tracker (45Hz - 220Hz) for Chord Inversions
+        if (freq >= 45.0 && freq <= 220.0)
         {
-            corr  += data[i] * data[i + lag];
-            norm1 += data[i] * data[i];
-            norm2 += data[i + lag] * data[i + lag];
-        }
-
-        float denom = std::sqrt (norm1 * norm2) + 1e-9f;
-        float r = corr / denom;
-
-        if (r > bestCorr)
-        {
-            bestCorr = r;
-            bestLag = lag;
+            int semiBin = juce::roundToInt (midiExact) % 12;
+            if (semiBin < 0) semiBin += 12;
+            bassChroma12[semiBin] += power * 1.5f;
         }
     }
 
-    confidence.store (bestCorr);
-    if (bestLag > 0 && bestCorr > 0.5f)
-        return static_cast<float> (currentSampleRate / static_cast<double> (bestLag));
+    if (totalEnergy < 0.05f)
+    {
+        const juce::SpinLock::ScopedLockType lock (stateLock);
+        currentConfidence *= 0.8f;
+        return;
+    }
 
-    return 0.0f;
+    // Normalize & smooth 24-bin spectrum
+    float maxVal = *std::max_element (chroma24.begin(), chroma24.end());
+    if (maxVal > 0.0f)
+    {
+        for (int i = 0; i < 24; ++i)
+        {
+            float norm = chroma24[i] / maxVal;
+            smoothedChroma24[i] = smoothedChroma24[i] * 0.72f + norm * 0.28f;
+            maqamHistogram[i] = maqamHistogram[i] * 0.985f + norm * 0.015f;
+        }
+    }
+
+    analyzeHarmonyAndMaqam();
 }
 
-juce::String MajedAudioProcessor::noteNameFromMidi (int midi) const
+void MajedAudioProcessor::analyzeHarmonyAndMaqam()
 {
-    if (midi < 0) return "--";
-    static const char* names[] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
-    int pc = ((midi % 12) + 12) % 12;
-    int octave = (midi / 12) - 1;
-    return juce::String (names[pc]) + juce::String (octave);
-}
+    static const char* noteNames[12] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
 
-juce::String MajedAudioProcessor::getDetectedNote() const
-{
-    return noteNameFromMidi (detectedMidi.load());
-}
+    // Collapse 24-TET into 12-TET for chord recognition (absorbing quarter-tones into neighboring semitones)
+    std::array<float, 12> chroma12 {};
+    for (int i = 0; i < 12; ++i)
+    {
+        int prevQ = (i * 2 - 1 + 24) % 24;
+        int exact = i * 2;
+        int nextQ = (i * 2 + 1) % 24;
+        chroma12[i] = smoothedChroma24[exact] + 0.5f * (smoothedChroma24[prevQ] + smoothedChroma24[nextQ]);
+    }
 
-juce::String MajedAudioProcessor::getSuggestedChord() const
-{
-    int root = suggestedRoot.load();
-    if (root < 0) return "--";
-    static const char* names[] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
-    return juce::String (names[root % 12]) + (suggestedQuality.load() == 1 ? "m" : "");
-}
+    // Find strongest Bass note for Inversion detection
+    int bassNote = -1;
+    float maxBass = 0.0f;
+    for (int i = 0; i < 12; ++i)
+    {
+        if (bassChroma12[i] > maxBass)
+        {
+            maxBass = bassChroma12[i];
+            bassNote = i;
+        }
+    }
 
-juce::String MajedAudioProcessor::getDetectedScale() const
-{
-    int root = suggestedRoot.load();
-    if (root < 0) return "Listening...";
-    static const char* names[] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
-    return juce::String (names[root % 12]) + (suggestedQuality.load() == 1 ? " Bayati / Minor" : " Rast / Major");
-}
+    // Chord Templates: { nameSuffix, intervals... }
+    struct ChordTemplate { const char* suffix; std::vector<int> intervals; };
+    static const std::vector<ChordTemplate> templates = {
+        { "",      { 0, 4, 7 } },       // Major
+        { "m",     { 0, 3, 7 } },       // Minor
+        { "7",     { 0, 4, 7, 10 } },   // Dominant 7
+        { "m7",    { 0, 3, 7, 10 } },   // Minor 7
+        { "maj7",  { 0, 4, 7, 11 } },   // Major 7
+        { "dim",   { 0, 3, 6 } },       // Diminished
+        { "sus4",  { 0, 5, 7 } },       // Suspended 4
+        { "sus2",  { 0, 2, 7 } }        // Suspended 2
+    };
 
-float MajedAudioProcessor::getConfidence() const
-{
-    return confidence.load();
-}
+    float bestChordScore = -1.0f;
+    int bestRoot = 0;
+    int bestTemplateIdx = 0;
 
-void MajedAudioProcessor::requestMidiExport()
-{
-    midiExportRequested.store (true);
-}
+    for (int root = 0; root < 12; ++root)
+    {
+        for (size_t t = 0; t < templates.size(); ++t)
+        {
+            float inChord = 0.0f;
+            float outChord = 0.0f;
+            std::array<bool, 12> active {};
 
-juce::AudioProcessorEditor* MajedAudioProcessor::createEditor()
-{
-    return new MajedAudioProcessorEditor (*this);
-}
+            for (int interval : templates[t].intervals)
+            {
+                int pc = (root + interval) % 12;
+                active[pc] = true;
+                inChord += chroma12[pc];
+            }
 
-juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
-{
-    return new MajedAudioProcessor();
-}
+            for (int i = 0; i < 12; ++i)
+                if (! active[i])
+                    outChord += chroma12[i];
+
+            float score = (inChord / templates[t].intervals.size()) - (outChord / (12.0f - templates[t].intervals.size())) * 0.65f;
+            if (bassNote == root)
+                score += 0.12f; // Root position bonus
+
+            if (score > bestChordScore)
+            {
+                bestChordScore = score;
+                bestRoot = root;
+                bestTemplateIdx = static_cast<int> (t);
+            }
+        }
+    }
+
+    // Build Chord Name + Inversion (e.g., Am/C, C/G)
+    juce::String detectedChordStr = juce::String (noteNames[bestRoot]) + templates[bestTemplateIdx].suffix;
+    std::vector<int> midiVoicing;
+
+    int rootMidi = 60 + bestRoot;
+    for (int interval : templates[bestTemplateIdx].intervals)
+        midiVoicing.push_back (rootMidi + interval);
+
+    if (bassNote >= 0 && bassNote != bestRoot && maxBass > 0.1f)
+    {
+        for (int interval : templates[bestTemplateIdx].intervals)
+        {
+            if ((bestRoot + interval) % 12 == bassNote)
+            {
+                detectedChordStr += "/" + juce::String (noteNames[bassNote]);
+                // Place inversion bass note one octave lower in MIDI voicing
+                midiVoicing.insert (midiVoicing.begin(), 48 + bassNote);
+                break;
+            }
+        }
+    }
+
+    // Arabic Maqam Recognition using 24-TET Quarter-Tone Profiles (0..23 steps)
+    struct MaqamProfile { const char* name; std::vector<int> steps24; };
+    static const std::vector<MaqamProfile> maqamat = {
+        { "Bayati (بيات)",      { 0, 3, 6, 10, 14, 16, 20 } },   // D - E half-flat - F - G - A - Bb - C
+        { "Rast (راست)",        { 0, 4, 7, 10, 14, 18, 21 } },   // C - D - E half-flat - F - G - A - B half-flat
+        { "Hijaz (حجاز)",       { 0, 2, 8, 10, 14, 16, 20 } },   // D - Eb - F# - G - A - Bb - C
+        { "Saba (صبا)",         { 0, 3, 6, 8, 14, 16, 20 } },    // D - E half-flat - F - Gb - A - Bb - C
+        { "Kurd (كرد)",         { 0, 2, 6, 10, 14, 16, 20 } },   // D - Eb - F - G - A - Bb - C
+        { "Nahawand (نهاوند)",  { 0, 4, 6, 10, 14, 16, 22 } },   // C - D - Eb - F - G - Ab - B
+        { "Sikah (سيكاه)",      { 0, 3, 7, 10, 13, 17, 20 } },   // E half-flat - F - G - A half-flat - Bb - C - D
+        { "Ajam (عجم)",         { 0, 4, 8, 10, 14, 18, 22 } }    // C - D - E - F - G - A - B
+    };
+
+    float bestMaqamScore = -1.0f;
+    int bestRukooz24 = 0;
+    int bestMaqamIdx = 0;
+
+    for (int rukooz = 0; rukooz < 24; rukooz += 2) // Test all 12 tonic degrees + quarter-tone Sikah
+    {
+        for (int shift = 0; shift <= 1; ++shift)
+        {
+            int tonic24 = (rukooz + shift) % 24;
+            for (size_t m = 0; m < maqamat.size(); ++m)
+            {
+                float matchSum = 0.0f;
+                for (int step : maqamat[m].steps24)
+                    matchSum += maqamHistogram[(tonic24 + step) % 24];
+
+                // Emphasize Rukooz (tonic) and 4th/5th scale degrees
+                matchSum += maqamHistogram[tonic24] * 0.45f;
+                matchSum += maqamHistogram[(tonic24 + 10) % 24] * 0.25f;
+
+                if (matchSum > bestMaqamScore)
+                {
+                    bestMaqamScore = matchSum;
+                    bestRukooz24 = tonic24;
+                    bestMaqamIdx = static_cast<int> (m);
+                }
+            }
+        }
+    }
+
+    juce::String rukoozStr = juce::String (noteNames[(bestRukooz24 / 2) % 12]);
+    if (bestRukooz24 % 2 != 0)
+        rukoozStr += " (Quarter-Flat / نصف بيمول)";
+
+    float conf = juce::jlimit (0.0f, 1.0f, bestChordScore * 1.3f);
+
+    const juce::SpinLock::ScopedLockType lock (stateLock);
+    currentChord = detectedChordStr;
+    currentMaqam = maqamat[bestMaqamIdx].name;
+    rukoozNote = rukoozStr;
+    currentConfidence = conf;
+    currentMidiNotes = midiVoicing;
+
+    if (conf > 0.35f)
+    {
+        if (chordHistory.empty() || chordHistory.back().chordName != detectedChordStr)
+        {
